@@ -1,0 +1,341 @@
+Parameters:
+  KeyPair: 
+    Type: AWS::EC2::KeyPair::KeyName
+  VPC:
+    Type: AWS::EC2::VPC::Id
+  Subnets: 
+    Type: List<AWS::EC2::Subnet::Id>
+  LatestAmiId :
+    Type : AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn-ami-hvm-x86_64-gp2
+
+Resources:
+
+  #################################
+  ### Set up Security #############
+  #################################
+
+  BatchInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/CloudWatchFullAccess
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+
+  BatchTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ecs-tasks.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: S3Access
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: 's3:GetObject'
+            Resource: arn:aws:s3:::1000genomes/*
+          - Effect: Allow
+            Action: 's3:*'
+            Resource: !Sub ${OutputBucket.Arn}/*
+
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - batch.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+
+  BatchSpotFleetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - spotfleet.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetRole
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - codebuild.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+      - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      - arn:aws:iam::aws:policy/AWSCodeCommitFullAccess
+
+  GitInitInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AWSCodeCommitFullAccess
+      - arn:aws:iam::aws:policy/AWSCodeBuildDeveloperAccess
+      Policies:
+      - PolicyName: EC2Terminate
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: 'ec2:TerminateInstances'
+            Resource: '*'
+
+
+  #################################
+  ### Set up the Batch Env ########
+  #################################
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  BatchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group used by the FastQC compute environment.
+      VpcId: !Ref VPC
+
+  ComputeEnvironmentInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Roles: [!Ref BatchInstanceRole]
+
+  ComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      ServiceRole: !Ref BatchServiceRole
+      ComputeEnvironmentName: FastQC
+      ComputeResources:
+        Type: SPOT
+        BidPercentage: 100
+        MinvCpus: 0
+        MaxvCpus: 256
+        DesiredvCpus: 0
+        InstanceRole: !Ref ComputeEnvironmentInstanceProfile
+        SpotIamFleetRole: !GetAtt BatchSpotFleetRole.Arn
+        SecurityGroupIds: [!Ref BatchSecurityGroup]
+        Subnets: !Ref Subnets
+        InstanceTypes: [optimal]
+        Ec2KeyPair: !Ref KeyPair
+      State: ENABLED
+
+  JobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: FastQC
+      ComputeEnvironmentOrder:
+      - Order: 1
+        ComputeEnvironment: !Ref ComputeEnvironment
+      State: ENABLED
+      Priority: 1
+
+  JobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      JobDefinitionName: FastQC
+      Parameters:
+        InputFile: s3://1000genomes/phase3/data/NA21144/sequence_read/ERR047877.filt.fastq.gz
+      ContainerProperties:
+        Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${FastQCRepository}
+        Command: ['fastqc.sh', 'Ref::InputFile']
+        Vcpus: 1
+        Memory: 500
+        JobRoleArn: !GetAtt BatchTaskRole.Arn
+
+  #################################
+  ### Set up the Build Pipeline ###
+  #################################
+
+  FastQCSource:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: FastQC
+
+  FastQCRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+
+  FastQCDockerBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: FastQC
+      TimeoutInMinutes: 10
+      Description: Builds the FastQC container for AWS Batch
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: true
+        Image: aws/codebuild/docker:1.12.1
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+        - Name: AWS_DEFAULT_REGION
+          Value: !Ref AWS::Region
+        - Name: AWS_ACCOUNT_ID
+          Value: !Ref AWS::AccountId
+        - Name: IMAGE_REPO_NAME
+          Value: !Ref FastQCRepository
+        - Name: IMAGE_TAG
+          Value: latest
+      ServiceRole: !Ref CodeBuildServiceRole
+      Source:
+        BuildSpec: buildspec.yml
+        GitCloneDepth: 0
+        Type: CODECOMMIT
+        Location: !GetAtt FastQCSource.CloneUrlHttp
+
+  #################################
+  ### Push the inital code ########
+  #################################
+
+  GitInitSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Used by the temporary instance to initialize the git repo.
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+
+  GitInitInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Roles: [!Ref GitInitInstanceRole]
+
+  GitInitInstance:
+    Type: AWS::EC2::Instance
+    Properties: 
+      InstanceType: t2.micro
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPair
+      SubnetId: !Select 
+      - 0
+      - !Ref Subnets
+      SecurityGroupIds: [!Ref GitInitSecurityGroup]
+      InstanceInitiatedShutdownBehavior: terminate
+      IamInstanceProfile: !Ref GitInitInstanceProfile
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #cloud-config
+            repo_update: true
+            repo_upgrade: all
+
+            packages:
+            - git
+
+            runcmd:
+            - export HOME=/root
+            - cd /fastqc
+            - git init
+            - git add .
+            - git commit -m "Uploaded from CFN template."
+            - git config --global credential.helper '!aws codecommit credential-helper --region ${AWS::Region} $@'
+            - git config --global credential.UseHttpPath true
+            - git remote add origin ${FastQCSource.CloneUrlHttp}
+            - git push -u origin master
+            - aws codebuild start-build --region ${AWS::Region} --project-name ${FastQCDockerBuild}
+            - aws ec2 terminate-instances --region ${AWS::Region} --instance-ids $(curl http://169.254.169.254/latest/meta-data/instance-id/)
+
+            write_files:
+            - path: fastqc/fastqc.sh
+              content: |
+                #! /bin/bash
+                aws s3 cp $1 .
+                filename=$(basename $1)
+                fastqc $filename
+                report=$(ls *.html)
+                aws s3 mv *.zip s3://${OutputBucket} --acl public-read
+                aws s3 mv *.html s3://${OutputBucket} --acl public-read
+                rm $filename
+                echo OUTPUT: https://s3.${AWS::Region}.amazonaws.com/${OutputBucket}/$report
+            - path: fastqc/Dockerfile
+              content: |
+                FROM biocontainers/fastqc
+                USER root
+                ADD fastqc.sh /home/biodocker/bin/fastqc.sh
+                RUN chown -v biodocker /home/biodocker/bin/fastqc.sh && chmod -v 764 /home/biodocker/bin/fastqc.sh && pip install awscli
+                USER biodocker
+                ENV PATH /home/biodocker/.local/bin:$PATH
+                CMD fastqc.sh s3://1000genomes/phase3/data/NA21144/sequence_read/ERR047877.filt.fastq.gz
+            - path: fastqc/buildspec.yml
+              content: |
+                version: 0.2
+                phases:
+                  pre_build:
+                    commands:
+                      - echo Logging in to Amazon ECR...
+                      - $(aws ecr get-login --no-include-email --region $AWS_DEFAULT_REGION)
+                  build:
+                    commands:
+                      - echo Build started on `date`
+                      - echo Building the Docker image...          
+                      - docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                      - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG      
+                  post_build:
+                    commands:
+                      - echo Build completed on `date`
+                      - echo Pushing the Docker image...
+                      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG

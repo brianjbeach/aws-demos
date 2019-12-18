@@ -1,0 +1,400 @@
+Parameters:
+  KeyPair: 
+    Type: AWS::EC2::KeyPair::KeyName
+  VPC:
+    Type: AWS::EC2::VPC::Id
+  Subnets: 
+    Type: List<AWS::EC2::Subnet::Id>
+  LatestAmiId :
+    Type : AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn-ami-hvm-x86_64-gp2
+
+Resources:
+
+  #################################
+  ### Set up Security #############
+  #################################
+
+  BatchInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/CloudWatchFullAccess
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+
+  BatchTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ecs-tasks.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: SQSAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: 'sqs:*'
+            Resource: !GetAtt ResultsQueue.Arn
+
+
+
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - batch.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+
+  BatchSpotFleetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - spotfleet.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetRole
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - codebuild.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+      - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      - arn:aws:iam::aws:policy/AWSCodeCommitFullAccess
+
+  GitInitInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AWSCodeCommitFullAccess
+      - arn:aws:iam::aws:policy/AWSCodeBuildDeveloperAccess
+      Policies:
+      - PolicyName: EC2Terminate
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: 'ec2:TerminateInstances'
+            Resource: '*'
+
+
+  #################################
+  ### Set up the Batch Env ########
+  #################################
+
+  ResultsQueue: 
+    Type: AWS::SQS::Queue
+
+  BatchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group used by the Pi compute environment.
+      VpcId: !Ref VPC
+
+  ComputeEnvironmentInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Roles: [!Ref BatchInstanceRole]
+
+  ComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      ServiceRole: !Ref BatchServiceRole
+      ComputeEnvironmentName: Pi
+      ComputeResources:
+        Type: SPOT
+        BidPercentage: 100
+        MinvCpus: 0
+        MaxvCpus: 16
+        DesiredvCpus: 0
+        InstanceRole: !Ref ComputeEnvironmentInstanceProfile
+        SpotIamFleetRole: !GetAtt BatchSpotFleetRole.Arn
+        SecurityGroupIds: [!Ref BatchSecurityGroup]
+        Subnets: !Ref Subnets
+        InstanceTypes: [optimal]
+        Ec2KeyPair: !Ref KeyPair
+      State: ENABLED
+
+  JobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: Pi
+      ComputeEnvironmentOrder:
+      - Order: 1
+        ComputeEnvironment: !Ref ComputeEnvironment
+      State: ENABLED
+      Priority: 1
+
+  CalculateJobDef:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      JobDefinitionName: Pi-Calculate
+      ContainerProperties:
+        Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${PiRepository}
+        Command: ['python', './batch-pi/calculate.py']
+        Vcpus: 1
+        Memory: 1000
+        JobRoleArn: !GetAtt BatchTaskRole.Arn
+
+  SummarizeJobDef:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      JobDefinitionName: Pi-Summarize
+      ContainerProperties:
+        Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${PiRepository}
+        Command: ['python', './batch-pi/summarize.py']
+        Vcpus: 1
+        Memory: 1000
+        JobRoleArn: !GetAtt BatchTaskRole.Arn
+
+  #################################
+  ### Set up the Build Pipeline ###
+  #################################
+
+  PiSource:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: Pi
+
+  PiRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+
+  PiDockerBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: Pi
+      TimeoutInMinutes: 10
+      Description: Builds the Pi container for AWS Batch
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: true
+        Image: aws/codebuild/docker:1.12.1
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+        - Name: AWS_DEFAULT_REGION
+          Value: !Ref AWS::Region
+        - Name: AWS_ACCOUNT_ID
+          Value: !Ref AWS::AccountId
+        - Name: IMAGE_REPO_NAME
+          Value: !Ref PiRepository
+        - Name: IMAGE_TAG
+          Value: latest
+      ServiceRole: !Ref CodeBuildServiceRole
+      Source:
+        BuildSpec: buildspec.yml
+        GitCloneDepth: 0
+        Type: CODECOMMIT
+        Location: !GetAtt PiSource.CloneUrlHttp
+
+  #################################
+  ### Push the inital code ########
+  #################################
+
+  GitInitSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Used by the temporary instance to initialize the git repo.
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+
+  GitInitInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Roles: [!Ref GitInitInstanceRole]
+
+  GitInitInstance:
+    Type: AWS::EC2::Instance
+    Properties: 
+      InstanceType: t2.micro
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyPair
+      SubnetId: !Select 
+      - 0
+      - !Ref Subnets
+      SecurityGroupIds: [!Ref GitInitSecurityGroup]
+      InstanceInitiatedShutdownBehavior: terminate
+      IamInstanceProfile: !Ref GitInitInstanceProfile
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #cloud-config
+            repo_update: true
+            repo_upgrade: all
+
+            packages:
+            - git
+
+            runcmd:
+            - export HOME=/root
+            - cd ./batch-pi
+            - git init
+            - git add .
+            - git commit -m "Uploaded from CFN template."
+            - git config --global credential.helper '!aws codecommit credential-helper --region ${AWS::Region} $@'
+            - git config --global credential.UseHttpPath true
+            - git remote add origin ${PiSource.CloneUrlHttp}
+            - git push -u origin master
+            - aws codebuild start-build --region ${AWS::Region} --project-name ${PiDockerBuild}
+            - aws ec2 terminate-instances --region ${AWS::Region} --instance-ids $(curl http://169.254.169.254/latest/meta-data/instance-id/)
+
+            write_files:
+            - path: batch-pi/calculate.py
+              content: |
+                from sys import argv
+                from random import uniform
+                from math import sqrt, pow
+                from os import getenv
+                import boto3, json
+
+
+                def calulate_pi(iterations):
+                    samples_in_circle = 0
+                    for i in range(1, iterations):
+                        x = uniform(-1, 1)
+                        y = uniform(-1, 1)
+                        distance_from_origin = sqrt(pow(x,2) + pow(y,2))
+                        if(distance_from_origin <= 1): samples_in_circle += 1
+                    return {
+                        "job": getenv("AWS_BATCH_JOB_ID", "NA"),
+                        "iterations": iterations,
+                        "pi": (4.0 * samples_in_circle / iterations)
+                    }
+
+
+                if __name__ == "__main__":
+                    if len(argv) == 1:
+                        iterations = 1000000
+                    else:
+                        iterations = int(argv[1])
+                    results = calulate_pi(iterations)
+                    print results
+                    
+                    # Queue the results for summarization
+                    sqs = boto3.resource('sqs')
+                    queue = sqs.get_queue_by_name(QueueName='${ResultsQueue.QueueName}')
+                    response = queue.send_message(MessageBody=json.dumps(results))
+            - path: batch-pi/summarize.py
+              content: |
+                from sys import argv
+                from random import uniform
+                from math import sqrt, pow
+                from os import getenv
+                import boto3, json
+
+
+                def summarize_pi():
+                    # Queue the results for summarization
+                    sqs = boto3.resource('sqs')
+                    queue = sqs.get_queue_by_name(QueueName='${ResultsQueue.QueueName}')
+                    
+                    sum = 0
+                    count = 0
+                    
+                    while True:
+                        messages = queue.receive_messages()
+                        if len(messages) == 0: 
+                            break
+                        for message in messages:
+                            results = json.loads(message.body)
+                            print(results)
+                            sum = sum + results["pi"]
+                            count = count + 1
+                            message.delete()
+                    return sum / count if count > 0 else 0 
+
+
+                if __name__ == "__main__":
+                    pi = summarize_pi()
+                    print "SUMMARY: %s" % pi
+            - path: batch-pi/Dockerfile
+              content: |
+                FROM amazonlinux
+                ADD . /batch-pi
+                RUN yum install -y wget
+                RUN wget https://bootstrap.pypa.io/get-pip.py && python get-pip.py && pip install boto3
+                ENV AWS_DEFAULT_REGION ${AWS::Region}
+                CMD python ./batch-pi/calculate.py
+            - path: batch-pi/buildspec.yml
+              content: |
+                version: 0.2
+                phases:
+                  pre_build:
+                    commands:
+                      - echo Logging in to Amazon ECR...
+                      - $(aws ecr get-login --no-include-email --region $AWS_DEFAULT_REGION)
+                  build:
+                    commands:
+                      - echo Build started on `date`
+                      - echo Building the Docker image...          
+                      - docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                      - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG      
+                  post_build:
+                    commands:
+                      - echo Build completed on `date`
+                      - echo Pushing the Docker image...
+                      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
